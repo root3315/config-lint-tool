@@ -64,9 +64,12 @@ class ConfigLinter:
         'test': 'Test environment reference detected',
     }
 
-    def __init__(self, strict: bool = False, schema_path: Optional[str] = None):
+    MAX_NESTING_DEPTH = 10
+
+    def __init__(self, strict: bool = False, schema_path: Optional[str] = None, max_depth: Optional[int] = None):
         self.strict = strict
         self.schema_path = schema_path
+        self.max_depth = max_depth or self.MAX_NESTING_DEPTH
         self.results: List[LintResult] = []
         self.schema_validator: Optional[SchemaValidator] = None
 
@@ -136,7 +139,7 @@ class ConfigLinter:
         for line_num, line in enumerate(lines, 1):
             line_lower = line.lower()
             for pattern, message in self.COMMON_MISTAKES.items():
-                if pattern in line_lower and '=' in line or ':' in line:
+                if pattern in line_lower and ('=' in line or ':' in line):
                     if 'example' not in line_lower and 'placeholder' not in line_lower:
                         self.results.append(LintResult('warning', line_num, message, line.strip()[:50]))
 
@@ -181,35 +184,72 @@ class ConfigLinter:
 
     def _lint_json(self, content: str, filepath: str) -> None:
         """Lint JSON configuration file."""
-        lines = content.split('\n')
-
         try:
             data = json.loads(content)
         except json.JSONDecodeError as e:
             self.results.append(LintResult('error', e.lineno, f"JSON syntax error: {e.msg}"))
             return
 
-        self._check_json_structure(data, 1)
+        self._check_nested_structure(data, 1)
 
         if isinstance(data, dict):
             if len(data) == 0:
                 self.results.append(LintResult('warning', 1, "Empty JSON object"))
 
-    def _check_json_structure(self, data: Any, base_line: int) -> None:
-        """Recursively check JSON structure for issues."""
+    def _check_nested_structure(self, data: Any, base_line: int, current_depth: int = 0, path: str = "") -> None:
+        """Recursively check nested structure for issues."""
+        if current_depth > self.max_depth:
+            path_str = path if path else "root"
+            self.results.append(LintResult(
+                'warning',
+                base_line,
+                f"Excessive nesting depth ({current_depth}) at '{path_str}'"
+            ))
+            return
+
         if isinstance(data, dict):
             keys = list(data.keys())
             if len(keys) != len(set(keys)):
                 self.results.append(LintResult('error', base_line, "Duplicate keys detected"))
 
+            if not keys and current_depth > 0:
+                self.results.append(LintResult(
+                    'warning',
+                    base_line,
+                    f"Empty object at '{path}'"
+                ))
+
             for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
                 if key.startswith('_') and self.strict:
                     self.results.append(LintResult('warning', base_line, f"Private key '{key}' in config"))
-                self._check_json_structure(value, base_line)
+                if isinstance(value, str) and not value.strip():
+                    self.results.append(LintResult(
+                        'warning',
+                        base_line,
+                        f"Empty string value for key '{current_path}'"
+                    ))
+                self._check_nested_structure(value, base_line, current_depth + 1, current_path)
 
         elif isinstance(data, list):
+            if not data:
+                self.results.append(LintResult(
+                    'warning',
+                    base_line,
+                    f"Empty array at '{path}'"
+                ))
+            else:
+                has_null = any(item is None for item in data)
+                if has_null:
+                    self.results.append(LintResult(
+                        'warning',
+                        base_line,
+                        f"Array contains null values at '{path}'"
+                    ))
+
             for i, item in enumerate(data):
-                self._check_json_structure(item, base_line)
+                current_path = f"{path}[{i}]"
+                self._check_nested_structure(item, base_line, current_depth + 1, current_path)
 
     def _lint_yaml(self, content: str, filepath: str) -> None:
         """Lint YAML configuration file."""
@@ -233,6 +273,7 @@ class ConfigLinter:
             self.results.append(LintResult('warning', 1, "Empty YAML document"))
             return
 
+        self._check_nested_structure(data, 1)
         self._check_yaml_anchors(content, lines)
 
     def _check_yaml_anchors(self, content: str, lines: List[str]) -> None:
@@ -296,6 +337,9 @@ class ConfigLinter:
 
         if not data:
             self.results.append(LintResult('warning', 1, "Empty TOML document"))
+            return
+
+        self._check_nested_structure(data, 1)
 
     def get_summary(self) -> str:
         """Get a summary of lint results."""
@@ -380,6 +424,7 @@ Examples:
   %(prog)s --format github *.yaml
   %(prog)s --strict app.toml
   %(prog)s --schema config_schema.json config.json
+  %(prog)s --max-depth 5 config.json
 '''
     )
 
@@ -394,6 +439,8 @@ Examples:
                         help='Patterns to exclude')
     parser.add_argument('--schema', type=str, default=None,
                         help='JSON Schema file to validate configs against')
+    parser.add_argument('--max-depth', type=int, default=None,
+                        help='Maximum allowed nesting depth (default: 10)')
 
     args = parser.parse_args()
 
@@ -411,7 +458,11 @@ Examples:
     for pattern in args.exclude:
         all_files = [f for f in all_files if not re.search(pattern, f)]
 
-    linter = ConfigLinter(strict=args.strict, schema_path=args.schema)
+    linter = ConfigLinter(
+        strict=args.strict,
+        schema_path=args.schema,
+        max_depth=args.max_depth
+    )
     total_errors = 0
     total_warnings = 0
 

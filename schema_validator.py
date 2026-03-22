@@ -31,8 +31,25 @@ class SchemaValidationResult:
         self.value = value
 
     def __str__(self) -> str:
-        path_str = ".".join(str(p) for p in self.path) if self.path else "(root)"
+        path_str = self._format_path()
         return f"[{path_str}] {self.message} (validator: {self.validator})"
+
+    def _format_path(self) -> str:
+        """Format the path for display, handling array indices."""
+        if not self.path:
+            return "(root)"
+        
+        parts = []
+        for p in self.path:
+            if isinstance(p, int):
+                parts.append(f"[{p}]")
+            else:
+                if parts and not str(parts[-1]).startswith('['):
+                    parts.append('.')
+                parts.append(str(p))
+        
+        result = ''.join(str(p) for p in parts)
+        return result if result else "(root)"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -110,6 +127,15 @@ class SchemaValidator:
             )
             results.append(result)
 
+            for sub_error in error.context:
+                sub_result = SchemaValidationResult(
+                    path=list(sub_error.absolute_path),
+                    message=self._format_error_message(sub_error),
+                    validator=sub_error.validator,
+                    value=sub_error.instance
+                )
+                results.append(sub_result)
+
         return results
 
     def _format_error_message(self, error: ValidationError) -> str:
@@ -154,7 +180,70 @@ class SchemaValidator:
             return f"String does not match format: {error.validator_value}"
 
         elif error.validator == "additionalProperties":
-            return f"Additional properties not allowed: {', '.join(error.instance.keys()) if isinstance(error.instance, dict) else error.instance}"
+            extra_props = set(error.instance.keys()) - set(error.schema.get('properties', {}).keys())
+            if extra_props:
+                return f"Additional properties not allowed: {', '.join(extra_props)}"
+            return "Additional properties not allowed"
+
+        elif error.validator == "minProperties":
+            return f"Object has too few properties: {len(error.instance)} (minimum: {error.validator_value})"
+
+        elif error.validator == "maxProperties":
+            return f"Object has too many properties: {len(error.instance)} (maximum: {error.validator_value})"
+
+        elif error.validator == "const":
+            return f"Value must be exactly: {error.validator_value}"
+
+        elif error.validator == "multipleOf":
+            return f"Value {error.instance} is not a multiple of {error.validator_value}"
+
+        elif error.validator == "exclusiveMinimum":
+            return f"Value {error.instance} must be greater than (not equal to) {error.validator_value}"
+
+        elif error.validator == "exclusiveMaximum":
+            return f"Value {error.instance} must be less than (not equal to) {error.validator_value}"
+
+        elif error.validator == "oneOf":
+            return f"Value must match exactly one schema, but matched {len(error.context)} or none"
+
+        elif error.validator == "anyOf":
+            return f"Value must match at least one schema"
+
+        elif error.validator == "allOf":
+            return f"Value must match all schemas"
+
+        elif error.validator == "if":
+            return f"Conditional schema validation failed"
+
+        elif error.validator == "then":
+            return f"'then' clause validation failed"
+
+        elif error.validator == "else":
+            return f"'else' clause validation failed"
+
+        elif error.validator == "not":
+            return f"Value must not match the schema"
+
+        elif error.validator == "propertyNames":
+            return f"Property name validation failed"
+
+        elif error.validator == "contains":
+            return f"Array must contain at least one item matching the schema"
+
+        elif error.validator == "dependentRequired":
+            return f"Missing dependent required properties: {', '.join(error.validator_value)}"
+
+        elif error.validator == "dependentSchemas":
+            return f"Dependent schema validation failed"
+
+        elif error.validator == "prefixItems":
+            return f"Array items do not match prefix schema"
+
+        elif error.validator == "unevaluatedProperties":
+            return f"Unevaluated properties not allowed"
+
+        elif error.validator == "unevaluatedItems":
+            return f"Unevaluated items not allowed"
 
         else:
             return error.message
@@ -185,6 +274,46 @@ def create_basic_schema(properties: Dict[str, Any], required: Optional[List[str]
         "type": "object",
         "properties": properties
     }
+
+    if required:
+        schema["required"] = required
+
+    return schema
+
+
+def create_nested_schema(
+    nested_props: Dict[str, Any],
+    required: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Create a JSON schema with nested property support.
+    
+    Args:
+        nested_props: Dictionary with dot-notation keys for nested properties.
+                      Example: {"database.host": {"type": "string"}, "database.port": {"type": "integer"}}
+        required: List of required properties (also supports dot-notation)
+    
+    Returns:
+        A JSON Schema dictionary with proper nested structure.
+    """
+    def set_nested(schema_dict: Dict, path: str, value: Any) -> None:
+        keys = path.split('.')
+        current = schema_dict
+        for key in keys[:-1]:
+            if key not in current:
+                current[key] = {"type": "object", "properties": {}}
+            if "properties" not in current[key]:
+                current[key]["properties"] = {}
+            current = current[key]["properties"]
+        current[keys[-1]] = value
+
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {}
+    }
+
+    for prop_path, prop_schema in nested_props.items():
+        set_nested(schema["properties"], prop_path, prop_schema)
 
     if required:
         schema["required"] = required
